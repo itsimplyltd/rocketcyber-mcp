@@ -354,3 +354,19 @@ describe("rocketcyber_list_events tool definition", () => {
     expect(tool.description).toMatch(/appId/);
   });
 });
+
+describe("tool definitions readOnlyHint annotations", () => {
+  it("marks every tool readOnlyHint: true, since this server issues no writes", async () => {
+    const { TOOL_DEFINITIONS } = await import("../handlers/tool.definitions.js");
+    expect(TOOL_DEFINITIONS.length).toBeGreaterThan(0);
+    for (const tool of TOOL_DEFINITIONS) {
+      expect(tool.annotations).toEqual({ readOnlyHint: true });
+    }
+  });
+
+  it("annotates rocketcyber_get_account as readOnlyHint: true", async () => {
+    const { TOOL_DEFINITIONS } = await import("../handlers/tool.definitions.js");
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === "rocketcyber_get_account")!;
+    expect(tool.annotations).toEqual({ readOnlyHint: true });
+  });
+});
