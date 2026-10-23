@@ -1,5 +1,5 @@
 # Multi-stage build for efficient container size
-FROM node:26-alpine AS builder
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS builder
 
 # Build arguments
 ARG VERSION="unknown"
@@ -32,7 +32,7 @@ RUN npm run build
 RUN npm prune --omit=dev && npm cache clean --force
 
 # Production stage
-FROM node:26-alpine AS production
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS production
 
 # Create a non-root user for security
 RUN addgroup -g 1001 -S rocketcyber && \
