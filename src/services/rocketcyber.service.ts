@@ -1,6 +1,10 @@
 import { RocketCyberClient } from '@wyre-technology/node-rocketcyber';
+import { installNoRedirectFetch } from '../utils/no-redirect-fetch.js';
 import { McpServerConfig } from '../types/mcp.js';
 import { Logger } from '../utils/logger.js';
+
+// Every vendor call goes through the global fetch; make a 3xx fail closed.
+installNoRedirectFetch();
 
 export class RocketCyberService {
   private client: RocketCyberClient | null = null;

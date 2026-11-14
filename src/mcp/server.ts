@@ -18,7 +18,33 @@ import { McpServerConfig } from '../types/mcp.js';
 import { EnvironmentConfig, parseCredentialsFromHeaders, GatewayCredentials } from '../utils/config.js';
 import { RocketCyberResourceHandler } from '../handlers/resource.handler.js';
 import { RocketCyberToolHandler } from '../handlers/tool.handler.js';
-import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
+import { verifyS2sHeader } from './s2s-verify.js';
+import {
+  NonceCache,
+  ReportRateLimiter,
+  assertRequireSignedHeaders,
+  effectiveMinVersion,
+  handleGatewayRequest,
+} from '../itsl/s2s-v3.js';
+
+// S2S v3 (phase A). The gateway's audience for this vendor: cred-router signs
+// with aud = 'rocketcyber' (finishSignedProxyRequest default: aud = vendor).
+export const S2S_AUDIENCE = 'rocketcyber';
+// The legacy verifier (s2s-verify.ts) is v1 only and nothing can tighten it, so
+// v1 is what is enforced today and the floor can only be 1.
+export const S2S_FLOOR = 1;
+const MIN_S2S_SECRET_LENGTH = 32;
+// Credential and region headers this backend reads in gateway mode. cred-router
+// does not set either today (the key is baked into this container), and its
+// client-header allow-list strips them if a caller sends them. If either ever
+// arrives on a v3 request it must be covered by the signature.
+export const REQUIRE_SIGNED_HEADERS = ['x-rocketcyber-api-key', 'x-rocketcyber-region'];
+assertRequireSignedHeaders(REQUIRE_SIGNED_HEADERS);
+
+// One per process: v3 nonces are single-use inside the skew window.
+const nonceCache = new NonceCache();
+const reportLimiter = new ReportRateLimiter();
+const failureLimiter = new ReportRateLimiter();
 
 export class RocketCyberMcpServer {
   private server: Server;
@@ -193,11 +219,37 @@ export class RocketCyberMcpServer {
     const host = this.envConfig?.transport?.host || '0.0.0.0';
     const isGatewayMode = this.envConfig?.auth?.mode === 'gateway';
 
-    this.httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-      const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    // Boot check: HTTP mode never starts without a real S2S secret. An empty or
+    // short secret used to mean "S2S disabled" (every /mcp request served
+    // unauthenticated); that is now a deployment fault. The value is never logged.
+    const s2sSecret = process.env.CONDUIT_S2S_SECRET || '';
+    if (s2sSecret.length < MIN_S2S_SECRET_LENGTH) {
+      throw new Error(
+        `Refusing to start HTTP server: CONDUIT_S2S_SECRET must be set to at least ${MIN_S2S_SECRET_LENGTH} characters ` +
+        '(for example the output of `openssl rand -hex 32`).'
+      );
+    }
 
-      // Health endpoint - no auth required
-      if (url.pathname === '/health') {
+    // Operator switch for the S2S v3 rollout. Raw: anything that is not an
+    // integer 1..3 is treated as 3 by the verifier (a typo can only tighten).
+    const minVersion = Number(process.env.ITSL_S2S_MIN_VERSION ?? String(S2S_FLOOR));
+    const effectiveMin = effectiveMinVersion(S2S_FLOOR, minVersion);
+    // The blanket header rule is enforced only at effective minimum 3; below
+    // that the verifier runs it in report mode (requireSignedHeaders still binds).
+    this.logger.info(
+      `S2S verification: effective minimum version ${effectiveMin}; ` +
+      `v3 header rule ${effectiveMin === 3 ? 'enforced' : 'in report mode'}`,
+      { s2sEffectiveMinVersion: effectiveMin, s2sHeaderRule: effectiveMin === 3 ? 'enforced' : 'report' }
+    );
+
+    this.httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      // Raw target, not a parsed URL: the signed path is exactly what was sent.
+      const rawTarget = req.url ?? '/';
+      const queryAt = rawTarget.indexOf('?');
+      const pathname = queryAt === -1 ? rawTarget : rawTarget.slice(0, queryAt);
+
+      // Health endpoint - no auth required, no vendor call, no credentials read.
+      if (pathname === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: 'ok',
@@ -208,91 +260,96 @@ export class RocketCyberMcpServer {
         return;
       }
 
-      // MCP endpoint — stateless: fresh server + transport per request
-      if (url.pathname === '/mcp') {
-        // Gateway S2S verification (gateway#377 parity). Runs before any
-        // credential extraction — see src/mcp/s2s-verify.ts. Empty secret
-        // means S2S enforcement isn't provisioned for this vendor yet, so
-        // we don't call verifyS2sHeader at all (dark-by-default).
-        const s2sSecret = process.env.CONDUIT_S2S_SECRET || '';
-        if (s2sSecret) {
-          const s2sHeader = req.headers[S2S_HEADER] as string | undefined;
-          if (!verifyS2sHeader(s2sHeader, s2sSecret)) {
-            this.logger.warn('Rejected request with missing/invalid gateway S2S header');
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              error: 'Unauthorized',
-              message: 'Missing or invalid gateway S2S authentication header',
-            }));
-            return;
-          }
-        }
-
-        // Only POST is supported in stateless mode
-        if (req.method !== 'POST') {
-          res.writeHead(405, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Method not allowed' },
-            id: null,
-          }));
-          return;
-        }
-
-        // In gateway mode, build per-request service + handlers from the
-        // injected credential headers. Each request gets its own isolated
-        // RocketCyberService so concurrent requests for different tenants
-        // never interfere with each other.
-        let perRequestToolHandler: RocketCyberToolHandler | undefined;
-        let perRequestResourceHandler: RocketCyberResourceHandler | undefined;
-        if (isGatewayMode) {
-          const credentials = this.extractGatewayCredentials(req);
-          if (!credentials.apiKey) {
-            this.logger.warn('Gateway mode: Missing required API key in headers');
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              error: 'Missing credentials',
-              message: 'Gateway mode requires X-RocketCyber-API-Key header',
-              required: ['X-RocketCyber-API-Key']
-            }));
-            return;
-          }
-          const handlers = this.buildPerRequestHandlers(credentials);
-          perRequestToolHandler = handlers.toolHandler;
-          perRequestResourceHandler = handlers.resourceHandler;
-        }
-
-        // Stateless: create fresh server + transport for each request
-        const server = this.createFreshServer(perRequestToolHandler, perRequestResourceHandler);
-        const transport = new StreamableHTTPServerTransport({
-          enableJsonResponse: true,
-        });
-
-        res.on('close', () => {
-          transport.close();
-          server.close();
-        });
-
-        server.connect(transport as unknown as Transport).then(() => {
-          transport.handleRequest(req, res);
-        }).catch((err) => {
-          this.logger.error('MCP transport error:', err);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              jsonrpc: '2.0',
-              error: { code: -32603, message: 'Internal error' },
-              id: null,
-            }));
-          }
-        });
-
+      // 404 for everything except the MCP endpoint, before any auth.
+      if (pathname !== '/mcp') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health'] }));
         return;
       }
 
-      // 404 for everything else
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health'] }));
+      // MCP endpoint. The shared wrapper runs the S2S check FIRST (before the
+      // method check or credential extraction), reads the body once, and never
+      // rejects: an aborted upload or a throwing handler ends that request, not
+      // the process. There is no unauthenticated mode (allowUnauthenticated is
+      // deliberately never set).
+      await handleGatewayRequest(
+        req,
+        res,
+        {
+          secret: s2sSecret,
+          aud: S2S_AUDIENCE,
+          floor: S2S_FLOOR,
+          minVersion,
+          verifyLegacy: (headerValue) => (verifyS2sHeader(headerValue, s2sSecret) ? 1 : 0),
+          nonceCache,
+          reportLimiter,
+          failureLimiter,
+          logger: this.logger,
+          requireSignedHeaders: REQUIRE_SIGNED_HEADERS,
+        },
+        async ({ parsedBody }) => {
+          // Only POST is supported in stateless mode
+          if (req.method !== 'POST') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'Method not allowed' },
+              id: null,
+            }));
+            return;
+          }
+
+          // In gateway mode, build per-request service + handlers from the
+          // injected credential headers. Each request gets its own isolated
+          // RocketCyberService so concurrent requests for different tenants
+          // never interfere with each other.
+          let perRequestToolHandler: RocketCyberToolHandler | undefined;
+          let perRequestResourceHandler: RocketCyberResourceHandler | undefined;
+          if (isGatewayMode) {
+            const credentials = this.extractGatewayCredentials(req);
+            if (!credentials.apiKey) {
+              this.logger.warn('Gateway mode: Missing required API key in headers');
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                error: 'Missing credentials',
+                message: 'Gateway mode requires X-RocketCyber-API-Key header',
+                required: ['X-RocketCyber-API-Key']
+              }));
+              return;
+            }
+            const handlers = this.buildPerRequestHandlers(credentials);
+            perRequestToolHandler = handlers.toolHandler;
+            perRequestResourceHandler = handlers.resourceHandler;
+          }
+
+          // Stateless: create fresh server + transport for each request
+          const server = this.createFreshServer(perRequestToolHandler, perRequestResourceHandler);
+          const transport = new StreamableHTTPServerTransport({
+            enableJsonResponse: true,
+          });
+
+          res.on('close', () => {
+            transport.close();
+            server.close();
+          });
+
+          try {
+            await server.connect(transport as unknown as Transport);
+            // The wrapper already consumed the body, so hand the transport the parsed JSON.
+            await transport.handleRequest(req, res, parsedBody);
+          } catch (err) {
+            this.logger.error('MCP transport error:', err);
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                jsonrpc: '2.0',
+                error: { code: -32603, message: 'Internal error' },
+                id: null,
+              }));
+            }
+          }
+        },
+      );
     });
 
     await new Promise<void>((resolve) => {
